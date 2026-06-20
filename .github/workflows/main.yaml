@@ -1,0 +1,115 @@
+name: Daily Update
+
+on:
+  schedule:
+    - cron: '0 8 * * *'
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Keep scheduled workflow activity
+        uses: WaterLemons2k/scheduled-workflow-activity-action@v2
+
+      - name: Checkout repository
+        uses: actions/checkout@v5
+
+      - name: Set up Go
+        uses: actions/setup-go@v6
+        with:
+          go-version: '1.25.0'
+          cache: false
+
+      - name: Build geoip
+        run: |
+          go install -trimpath -ldflags="-s -w -buildid=" github.com/Loyalsoldier/geoip@latest
+          mkdir -p publish
+          geoip convert
+
+      - name: Build db and metadb file
+        run: |
+          cd publish || exit 1
+          go install -trimpath -ldflags="-s -w -buildid=" github.com/metacubex/geo/cmd/geo@master
+          geo convert ip -i v2ray -o sing -f geoip.db ./geoip.dat
+          geo convert ip -i v2ray -o meta -f geoip.metadb ./geoip.dat
+
+      - name: Commit and push
+        run: |
+          cd publish || exit 1
+          git init
+          git config --local user.email "github-actions[bot]@users.noreply.github.com"
+          git config --local user.name "github-actions[bot]"
+          git checkout -b release
+          git add .
+          git commit -m "Auto-update"
+          git remote add origin "https://${{ github.actor }}:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}"
+          git push -f -u origin release
+
+      - name: Purge jsdelivr CDN
+        run: |
+          cd publish || exit 1
+          find . -type f \( -name "*.mmdb" -o -name "*.dat" -o -name "*.metadb" -o -name "*.db"\) -print0 | while IFS= read -r -d '' path; do
+            file_path="${path#./}"
+            echo "Purging $file_path"
+            curl -s -I "https://purge.jsdelivr.net/gh/${{ github.repository }}@release/$file_path"
+          done
+
+      - name: Custom clean up workflow runs
+        uses: actions/github-script@v9
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const { owner, repo } = context.repo
+
+            const runs = await github.paginate(github.rest.actions.listWorkflowRunsForRepo, {
+              owner,
+              repo,
+              per_page: 100
+            })
+
+            const now = new Date()
+            console.log(now.toLocaleString('sv-SE'))
+            const todayStr = now.toLocaleDateString('sv-SE')
+
+            const yesterday = new Date(now)
+            yesterday.setDate(yesterday.getDate() - 1)
+            const yesterdayStr = yesterday.toLocaleDateString('sv-SE')
+
+            const allowedDays = [todayStr, yesterdayStr]
+
+            const keptRuns = new Set()
+
+            for (const run of runs) {
+              const dateString = new Date(run.created_at).toLocaleDateString('sv-SE')
+              const cacheKey = `${run.workflow_id}-${dateString}`
+
+              if (!allowedDays.includes(dateString)) {
+                console.log(`[Delete] Run ${run.id} (${run.name}, ${dateString}) - Older than 2 days`)
+                try {
+                  await github.rest.actions.deleteWorkflowRun({ owner, repo, run_id: run.id })
+                } catch (e) {
+                  console.log(`Skipped or failed: ${e.message}`)
+                }
+                continue
+              }
+
+              if (keptRuns.has(cacheKey)) {
+                console.log(`[Delete] Run ${run.id} (${run.name}, ${dateString}) - Not the latest for this date`)
+                try {
+                  await github.rest.actions.deleteWorkflowRun({ owner, repo, run_id: run.id })
+                } catch (e) {
+                  console.log(`Skipped or failed (possibly running): ${e.message}`)
+                }
+              } else {
+                console.log(`[Retain] Run ${run.id} (${run.name}, ${dateString}) - Latest for this date`)
+                keptRuns.add(cacheKey)
+              }
+            }
+
+    env:
+      TZ: Asia/Shanghai
